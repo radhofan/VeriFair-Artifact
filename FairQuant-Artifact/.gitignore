@@ -1,0 +1,14 @@
+# from make all
+FairQuant/*.o
+FairQuant/network_test
+
+# from experimental results
+Fairify/src/*/res/*.csv
+FairQuant/res/*.txt
+
+# for FairQuant
+Fairify/fenv/
+
+# others
+.vscode
+.DS_Store

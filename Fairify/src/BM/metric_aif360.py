@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+
+from itertools import chain, combinations, product
+import math
+import random
+import scipy.stats as st
+from scipy.stats import qmc
+from aif360.datasets import BinaryLabelDataset
+from aif360.metrics import BinaryLabelDatasetMetric, ClassificationMetric
+import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score
+import tensorflow as tf
+import numpy as np
+
+def set_all_seeds(seed=42):
+    """Set all random seeds for reproducible results"""
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'  
+
+def create_aif360_dataset(X, y, feature_names, protected_attribute='age', 
+                         favorable_label=1, unfavorable_label=0):
+    df = pd.DataFrame(X, columns=feature_names)
+    df['label'] = y
+    
+    dataset = BinaryLabelDataset(
+        favorable_label=favorable_label,
+        unfavorable_label=unfavorable_label,
+        df=df,
+        label_names=['label'],
+        protected_attribute_names=[protected_attribute]
+    )
+    return dataset
+
+def safe_metric_value(metric_value):
+    """Safely extract scalar value from metric result."""
+    if isinstance(metric_value, np.ndarray):
+        if metric_value.size == 1:
+            return metric_value.item()
+        else:
+            return np.mean(metric_value)
+    return metric_value
+
+def measure_fairness_aif360(model, X_test, y_test, feature_names, 
+                           protected_attribute='age', pa_col_idx=0):
+
+    predictions = model.predict(X_test)
+    pred_binary = (predictions > 0.5).astype(int).flatten()
+
+    acc = accuracy_score(y_test, pred_binary)
+    f1 = f1_score(y_test, pred_binary)
+    
+    print(f"Accuracy: {acc:.3f}")
+    print(f"F1 Score: {f1:.3f}")
+    
+    dataset_orig = create_aif360_dataset(X_test, y_test, feature_names, protected_attribute)
+    dataset_pred = create_aif360_dataset(X_test, pred_binary, feature_names, protected_attribute)
+    
+    unprivileged_groups = [{protected_attribute: 0}]
+    privileged_groups = [{protected_attribute: 1}]
+    
+    classified_metric = ClassificationMetric(
+        dataset_orig, dataset_pred,
+        unprivileged_groups=unprivileged_groups,
+        privileged_groups=privileged_groups
+    )
+    
+    metric_pred = BinaryLabelDatasetMetric(
+        dataset_pred,
+        unprivileged_groups=unprivileged_groups,
+        privileged_groups=privileged_groups
+    )
+    
+    di = classified_metric.disparate_impact()
+    spd = classified_metric.mean_difference()
+    eod = classified_metric.equal_opportunity_difference()
+    aod = classified_metric.average_odds_difference()
+    erd = classified_metric.error_rate_difference()
+    cnt = metric_pred.consistency()  
+    ti = classified_metric.theil_index()
+    
+    print(f"\n=== FAIRNESS METRICS (AIF360) ===")
+    print(f"Disparate Impact (DI):            {di:.3f}")
+    print(f"Statistical Parity Difference:    {spd:.3f}")
+    print(f"Equal Opportunity Difference:     {eod:.3f}")
+    print(f"Average Odds Difference:          {aod:.3f}")
+    print(f"Error Rate Difference:            {erd:.3f}")
+    print(f"Consistency (CNT):                {float(cnt):.3f}")
+    print(f"Theil Index:                      {ti:.3f}")
+    
+    return {
+        'accuracy': acc,
+        'f1_score': f1,
+        'disparate_impact': di,
+        'statistical_parity_diff': spd,
+        'equal_opportunity_diff': eod,
+        'average_odds_diff': aod,
+        'error_rate_diff': erd,
+        'consistency': float(cnt),
+        'theil_index': ti
+    }
+
+if __name__ == "__main__":
+    import sys
+    import os
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    src_dir = os.path.abspath(os.path.join(script_dir, '../../'))
+    sys.path.append(src_dir)
+    from utils.verif_utils import *
+    from tensorflow.keras.models import load_model
+    from sklearn.metrics import accuracy_score, f1_score
+    import numpy as np
+
+    model_1_path = 'Fairify/models/bank/BM-1.h5'
+    model_2_path = 'Fairify/models/bank/BM-1-AdvDb.h5'
+    model_3_path = 'Fairify/models/bank/BM-1-Ruler.h5'
+    model_4_path = 'Fairify/models/bank/BM-1-Neufair.h5'
+    model_5_path = 'Fairify/models/bank/BM-1-Runner.h5'
+    model_6_path = 'Fairify/models/bank/BM-1-Retrained.h5'
+
+    model_1 = load_model(model_1_path)
+    model_2 = load_model(model_2_path)
+    model_3 = load_model(model_3_path)
+    model_4 = load_model(model_4_path)
+    model_5 = load_model(model_5_path)
+    model_6 = load_model(model_6_path)
+
+    df, X_train, y_train, X_test, y_test, encoders = load_bank()
+    feature_names = [
+        "age", "job", "marital", "education", "default", "housing", "loan",
+        "contact", "month", "day_of_week", "duration", "emp.var.rate",
+        "campaign", "pdays", "previous", "poutcome"
+    ]
+
+    print("="*40)
+    y_pred_1 = (model_1.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    print("Model:", os.path.basename(model_1_path).replace('.h5', ''))
+    print("Accuracy:", round(accuracy_score(y_test, y_pred_1), 4))
+    print("F1 Score:", round(f1_score(y_test, y_pred_1), 3))
+    print("\n=== FAIRNESS METRICS (AIF360) ===")
+    measure_fairness_aif360(model_1, X_test, y_test, feature_names, protected_attribute='age')
+    print("="*40)
+
+    y_pred_2 = (model_2.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    print("Model:", os.path.basename(model_2_path).replace('.h5', ''))
+    print("Accuracy:", round(accuracy_score(y_test, y_pred_2), 4))
+    print("F1 Score:", round(f1_score(y_test, y_pred_2), 3))
+    print("\n=== FAIRNESS METRICS (AIF360) ===")
+    measure_fairness_aif360(model_2, X_test, y_test, feature_names, protected_attribute='age')
+    print("="*40)
+
+    y_pred_3 = (model_3.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    print("Model:", os.path.basename(model_3_path).replace('.h5', ''))
+    print("Accuracy:", round(accuracy_score(y_test, y_pred_3), 4))
+    print("F1 Score:", round(f1_score(y_test, y_pred_3), 3))
+    print("\n=== FAIRNESS METRICS (AIF360) ===")
+    measure_fairness_aif360(model_3, X_test, y_test, feature_names, protected_attribute='age')
+    print("="*40)
+
+    y_pred_4 = (model_4.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    print("Model:", os.path.basename(model_4_path).replace('.h5', ''))
+    print("Accuracy:", round(accuracy_score(y_test, y_pred_4), 4))
+    print("F1 Score:", round(f1_score(y_test, y_pred_4), 3))
+    print("\n=== FAIRNESS METRICS (AIF360) ===")
+    measure_fairness_aif360(model_4, X_test, y_test, feature_names, protected_attribute='age')
+    print("="*40)
+
+    y_pred_5 = (model_5.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    print("Model:", os.path.basename(model_5_path).replace('.h5', ''))
+    print("Accuracy:", round(accuracy_score(y_test, y_pred_5), 4))
+    print("F1 Score:", round(f1_score(y_test, y_pred_5), 3))
+    print("\n=== FAIRNESS METRICS (AIF360) ===")
+    measure_fairness_aif360(model_5, X_test, y_test, feature_names, protected_attribute='age')
+    print("="*40)
+
+    y_pred_6 = (model_6.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    print("Model:", os.path.basename(model_6_path).replace('.h5', ''))
+    print("Accuracy:", round(accuracy_score(y_test, y_pred_6), 4))
+    print("F1 Score:", round(f1_score(y_test, y_pred_6), 3))
+    print("\n=== FAIRNESS METRICS (AIF360) ===")
+    measure_fairness_aif360(model_6, X_test, y_test, feature_names, protected_attribute='age')
+    print("="*40)
+
+
+# if __name__ == "__main__":
+#     import sys
+#     import os
+#     script_dir = os.path.dirname(os.path.abspath(__file__))
+#     src_dir = os.path.abspath(os.path.join(script_dir, '../../'))
+#     sys.path.append(src_dir)
+#     from utils.verif_utils import *
+#     from tensorflow.keras.models import load_model
+#     import numpy as np
+    
+#     ORIGINAL_MODEL_NAME = "BM-12"        
+#     FAIRER_MODEL_NAME = "BM-12-Ruler"
+#     ORIGINAL_MODEL_PATH = f'Fairify/models/bank/{ORIGINAL_MODEL_NAME}.h5'
+#     FAIRER_MODEL_PATH = f'Fairify/models/bank/{FAIRER_MODEL_NAME}.h5'
+
+#     print("Loading models...")
+#     original_model = load_model(ORIGINAL_MODEL_PATH)
+#     fairer_model = load_model(FAIRER_MODEL_PATH)
+
+#     df, X_train, y_train, X_test, y_test, encoders = load_bank()
+#     feature_names = [ "age", "job", "marital", "education", "default", "housing", "loan", 
+#                       "contact", "month", "day_of_week", "duration", "emp.var.rate", 
+#                       "campaign", "pdays", "previous", "poutcome" ]
+
+#     print("="*40)
+
+#     y_pred_orig = (original_model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+#     y_pred_fair = (fairer_model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    
+#     accuracy_orig = accuracy_score(y_test, y_pred_orig)
+#     accuracy_fair = accuracy_score(y_test, y_pred_fair)
+    
+#     print(f"Original model accuracy: {accuracy_orig:.4f}")
+#     print(f"Fairer model accuracy: {accuracy_fair:.4f}")
+
+#     print("="*40)
+
+#     print("\n=== ORIGINAL MODEL FAIRNESS (AIF360) ===")
+#     original_metrics = measure_fairness_aif360(original_model, X_test, y_test, 
+#                                              feature_names, protected_attribute='age')
+    
+#     print("\n=== FAIRER MODEL FAIRNESS (AIF360) ===")
+#     original_metrics = measure_fairness_aif360(fairer_model, X_test, y_test, 
+#                                              feature_names, protected_attribute='age')
+    
+#     print("="*40)

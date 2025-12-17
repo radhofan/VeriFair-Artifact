@@ -1,0 +1,6 @@
+{
+  "model_files_processed": "UCI-1",
+  "partition_results": {
+    "(('Dalc', 1, 5), ('Fedu', 0, 4), ('Fjob', 0, 4), ('Medu', 0, 4), ('Mjob', 0, 4), ('Pstatus', 0, 1), ('Walc', 1, 5), ('absences', 0, 3), ('activities', 0, 1), ('address', 0, 1), ('age', 0, 1), ('failures', 0, 3), ('famrel', 1, 5), ('famsize', 0, 1), ('famsup', 0, 1), ('freetime', 1, 5), ('goout', 1, 5), ('guardian', 0, 2), ('health', 1, 5), ('higher', 0, 1), ('internet', 0, 1), ('nursery', 0, 1), ('paid', 0, 1), ('reason', 0, 3), ('romantic', 0, 1), ('school', 0, 1), ('schoolsup', 0, 1), ('sex', 0, 1), ('studytime', 1, 4), ('traveltime', 1, 4))": "unknown"
+  }
+}
