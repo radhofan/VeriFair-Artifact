@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
+
+import torch
+import numpy as np
+import itertools
+from itertools import chain, combinations, product
+import math
+import random
+import scipy.stats as st
+from scipy.stats import qmc
+from sklearn.metrics import accuracy_score, f1_score
+import tensorflow as tf
+import os
+
+def set_all_seeds(seed=42):
+    """Set all random seeds for reproducible results"""
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'  
+
+
+def clustering(data, c_num):
+    from sklearn import cluster
+    kmeans = cluster.KMeans(n_clusters=c_num)
+    y_pred = kmeans.fit_predict(data)
+    return [data[y_pred == n] for n in range(c_num)]
+
+
+def clip(instance, constraint):
+    return np.minimum(constraint[:, 1], np.maximum(constraint[:, 0], instance))
+
+
+def random_pick(probability):
+    random_number = np.random.rand()
+    current_proba = 0
+    for i in range(len(probability)):
+        current_proba += probability[i]
+        if current_proba > random_number:
+            return i
+
+
+def get_seed(clustered_data, X_len, c_num, cluster_i, fashion='RoundRobin'):
+    if fashion == 'RoundRobin':
+        index = np.random.randint(0, len(clustered_data[cluster_i]))
+        return clustered_data[cluster_i][index]
+    elif fashion == 'Distribution':
+        pick_probability = [len(clustered_data[i]) / X_len for i in range(c_num)]
+        x = clustered_data[random_pick(pick_probability)]
+        index = np.random.randint(0, len(x))
+        return x[index]
+
+
+def similar_set(x, num_attribs, protected_attribs, constraint):
+    similar_x = np.empty(shape=(0, num_attribs))
+
+    protected_domain = []
+    for i in protected_attribs:
+        protected_domain = protected_domain + [list(range(constraint[i][0], constraint[i][1] + 1))]
+    all_combs = np.array(list(itertools.product(*protected_domain)))
+    for comb in all_combs:
+        x_new = x.copy()
+        for a, c in zip(protected_attribs, comb):
+            x_new[a] = c
+        similar_x = np.append(similar_x, [x_new], axis=0)
+    return similar_x
+
+
+def is_discriminatory(x, similar_x, model):
+    x_input = np.array(x).reshape(1, -1)
+    logit = model(x_input).numpy()
+    
+    if logit.shape[1] > 1:
+        y_pred = np.argmax(logit, axis=1)[0]
+    else:
+        y_pred = (logit > 0.5).astype(int)[0][0]
+    
+    for x_new in similar_x:
+        x_new_input = np.array(x_new).reshape(1, -1)
+        logit_similar = model(x_new_input).numpy()
+        
+        if logit_similar.shape[1] > 1:
+            y_pre_similar = np.argmax(logit_similar, axis=1)[0]
+        else:
+            y_pre_similar = (logit_similar > 0.5).astype(int)[0][0]
+            
+        if y_pre_similar != y_pred:
+            return True
+    return False
+
+
+def max_diff(x, similar_x, model):
+    x_input = np.array(x).reshape(1, -1)
+    y_pred_proba = model(x_input).numpy()
+
+    def distance(x_new):
+        x_new_input = np.array(x_new).reshape(1, -1)
+        return np.sum(np.square(y_pred_proba - model(x_new_input).numpy()))
+
+    max_dist = 0.0
+    x_potential_pair = x.copy()
+    for x_new in similar_x:
+        if distance(x_new) > max_dist:
+            max_dist = distance(x_new)
+            x_potential_pair = x_new.copy()
+    return x_potential_pair
+
+
+def find_pair(x, similar_x, model):
+    pairs = np.empty(shape=(0, len(x)))
+    x_input = np.array(x).reshape(1, -1)
+    y_pred = (model(x_input).numpy() > 0.5)
+    
+    for x_pair in similar_x:
+        x_pair_input = np.array(x_pair).reshape(1, -1)
+        if (model(x_pair_input).numpy() > 0.5) != y_pred:
+            pairs = np.append(pairs, [x_pair], axis=0)
+    
+    selected_p = random_pick([1.0 / pairs.shape[0]] * pairs.shape[0])
+    return pairs[selected_p]
+
+
+def normalization(grad1, grad2, protected_attribs, epsilon):
+    gradient = np.zeros_like(grad1)
+    grad1 = np.abs(grad1)
+    grad2 = np.abs(grad2)
+    for i in range(len(gradient)):
+        saliency = grad1[i] + grad2[i]
+        gradient[i] = 1.0 / (saliency + epsilon)
+        if i in protected_attribs:
+            gradient[i] = 0.0
+    gradient_sum = np.sum(gradient)
+    probability = gradient / gradient_sum
+    return probability
+
+
+def purely_random(num_attribs, protected_attribs, constraint, model, gen_num):
+    gen_id = np.empty(shape=(0, num_attribs))
+    for i in range(gen_num):
+        x_picked = [0] * num_attribs
+        for a in range(num_attribs):
+            x_picked[a] = np.random.randint(constraint[a][0], constraint[a][1] + 1)
+        similar_set_data = similar_set(x_picked, num_attribs, protected_attribs, constraint)
+        if is_discriminatory(x_picked, similar_set_data, model):
+            gen_id = np.append(gen_id, [x_picked], axis=0)
+    return gen_id
+
+
+def ids_percentage(sample_round, num_gen, num_attribs, protected_attribs, constraint, model):
+    """
+    Compute the percentage of individual discriminatory instances with 95% confidence
+    """
+    statistics = np.empty(shape=(0,))
+    for i in range(sample_round):
+        gen_id = purely_random(num_attribs, protected_attribs, constraint, model, num_gen)
+        percentage = len(gen_id) / num_gen
+        statistics = np.append(statistics, [percentage], axis=0)
+    avg = np.average(statistics)
+    std_dev = np.std(statistics)
+    interval = 1.960 * std_dev / np.sqrt(sample_round)
+    print('The percentage of individual discriminatory instances with .95 confidence:', avg, '±', interval)
+    return avg, interval
+
+
+class FairnessEvaluator:
+    """
+    Simple fairness evaluator for individual discrimination using generation utilities
+    """
+    
+    def __init__(self, model, constraint, protected_attribs=None, num_attribs=23):
+        self.model = model
+        self.constraint = constraint
+        self.protected_attribs = protected_attribs if protected_attribs else [1]  # Default: SEX
+        self.num_attribs = num_attribs
+    
+    def evaluate_individual_fairness(self, sample_round=10, num_gen=100):
+        """
+        Evaluate individual fairness using generation utilities
+        """
+        return ids_percentage(sample_round, num_gen, self.num_attribs, 
+                            self.protected_attribs, self.constraint, self.model)
+        
+if __name__ == "__main__":
+    import sys
+    import os
+    import numpy as np
+    import random
+    from tensorflow.keras.models import load_model
+    
+    np.random.seed(42)
+    random.seed(42)
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    src_dir = os.path.abspath(os.path.join(script_dir, '../../'))
+    sys.path.append(src_dir)
+    from utils.verif_utils import *
+    
+    # Define all model paths
+    # model_1_path = 'Fairify/models/default/DF-5.h5'
+    # model_2_path = 'Fairify/models/default/DF-5-AdvDb.h5'
+    # model_3_path = 'Fairify/models/default/DF-5-Ruler.h5'
+    # model_4_path = 'Fairify/models/default/DF-5-Runner.h5'
+    # model_5_path = 'Fairify/models/default/DF-5-Neufair.h5'
+    model_6_path = 'Fairify/models/default/DF-5-Retrained.h5'
+    
+    print("Loading models...")
+    # model_1 = load_model(model_1_path)
+    # model_2 = load_model(model_2_path)
+    # model_3 = load_model(model_3_path)
+    # model_4 = load_model(model_4_path)
+    # model_5 = load_model(model_5_path)
+    model_6 = load_model(model_6_path)
+    
+    df, X_train, y_train, X_test, y_test = load_default()
+    print("="*40)
+    
+    # Feature order in Default dataset:
+    # 0: LIMIT_BAL, 1: SEX, 2: EDUCATION, 3: MARRIAGE, 4: AGE,
+    # 5-10: PAY_1 to PAY_6,
+    # 11-16: BILL_AMT1 to BILL_AMT6,
+    # 17-22: PAY_AMT1 to PAY_AMT6
+    
+    # Constraint based on preprocessed data (after binning and encoding)
+    constraint = np.array([
+        [0, 4],       # LIMIT_BAL (binned to 5 bins: 0-4)
+        [0, 1],       # SEX (0=Female, 1=Male)
+        [0, 3],       # EDUCATION (0-3)
+        [0, 2],       # MARRIAGE (0-2)
+        [0, 4],       # AGE (binned to 5 bins: 0-4)
+        [0, 2],       # PAY_1 (0=on-time, 1=slight delay, 2=severe delay)
+        [0, 2],       # PAY_2
+        [0, 2],       # PAY_3
+        [0, 2],       # PAY_4
+        [0, 2],       # PAY_5
+        [0, 2],       # PAY_6
+        [0, 4],       # BILL_AMT1 (binned to 5 bins: 0-4)
+        [0, 4],       # BILL_AMT2
+        [0, 4],       # BILL_AMT3
+        [0, 4],       # BILL_AMT4
+        [0, 4],       # BILL_AMT5
+        [0, 4],       # BILL_AMT6
+        [0, 4],       # PAY_AMT1 (binned to 5 bins: 0-4)
+        [0, 4],       # PAY_AMT2
+        [0, 4],       # PAY_AMT3
+        [0, 4],       # PAY_AMT4
+        [0, 4],       # PAY_AMT5
+        [0, 4]        # PAY_AMT6
+    ])
+    
+    def evaluate_model(model_path, model):
+        print(f"Model: {os.path.basename(model_path).replace('.h5', '')}")
+        
+        # Individual Fairness Evaluation
+        evaluator = FairnessEvaluator(model, constraint, protected_attribs=[1])  # SEX
+        evaluator.evaluate_individual_fairness()
+        
+        # Accuracy Evaluation
+        y_pred = (model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+        accuracy = accuracy_score(y_test, y_pred)
+        
+        print(f"Model accuracy: {accuracy:.4f}")
+        print("="*40)
+    
+    print("Using FairnessEvaluator class:\n")
+    
+    # evaluate_model(model_1_path, model_1)
+    # evaluate_model(model_2_path, model_2)
+    # evaluate_model(model_3_path, model_3)
+    # evaluate_model(model_4_path, model_4)
+    # evaluate_model(model_5_path, model_5)
+    evaluate_model(model_6_path, model_6)
+
+# if __name__ == "__main__":
+#     import sys
+#     import os
+
+#     np.random.seed(42)
+#     random.seed(42)
+
+#     from tensorflow.keras.models import load_model
+#     script_dir = os.path.dirname(os.path.abspath(__file__))
+#     src_dir = os.path.abspath(os.path.join(script_dir, '../../'))
+#     sys.path.append(src_dir)
+#     from utils.verif_utils import *
+    
+#     ORIGINAL_MODEL_NAME = "DF-1"        
+#     FAIRER_MODEL_NAME = "DF-1-Retrained"
+#     ORIGINAL_MODEL_PATH = f'Fairify/models/default/{ORIGINAL_MODEL_NAME}.h5'
+#     FAIRER_MODEL_PATH = f'Fairify/models/default/{FAIRER_MODEL_NAME}.h5'
+    
+#     print("Loading models...")
+#     original_model = load_model(ORIGINAL_MODEL_PATH)
+#     fairer_model = load_model(FAIRER_MODEL_PATH)
+    
+#     df, X_train, y_train, X_test, y_test = load_default()
+
+#     print("="*40)
+    
+#     # Feature order in Default dataset:
+#     # 0: LIMIT_BAL, 1: SEX, 2: EDUCATION, 3: MARRIAGE, 4: AGE,
+#     # 5-10: PAY_1 to PAY_6,
+#     # 11-16: BILL_AMT1 to BILL_AMT6,
+#     # 17-22: PAY_AMT1 to PAY_AMT6
+    
+#     # Constraint based on preprocessed data (after binning and encoding)
+#     constraint = np.array([
+#         [0, 4],       # LIMIT_BAL (binned to 5 bins: 0-4)
+#         [0, 1],       # SEX (0=Female, 1=Male)
+#         [0, 3],       # EDUCATION (0-3)
+#         [0, 2],       # MARRIAGE (0-2)
+#         [0, 4],       # AGE (binned to 5 bins: 0-4)
+#         [0, 2],       # PAY_1 (0=on-time, 1=slight delay, 2=severe delay)
+#         [0, 2],       # PAY_2
+#         [0, 2],       # PAY_3
+#         [0, 2],       # PAY_4
+#         [0, 2],       # PAY_5
+#         [0, 2],       # PAY_6
+#         [0, 4],       # BILL_AMT1 (binned to 5 bins: 0-4)
+#         [0, 4],       # BILL_AMT2
+#         [0, 4],       # BILL_AMT3
+#         [0, 4],       # BILL_AMT4
+#         [0, 4],       # BILL_AMT5
+#         [0, 4],       # BILL_AMT6
+#         [0, 4],       # PAY_AMT1 (binned to 5 bins: 0-4)
+#         [0, 4],       # PAY_AMT2
+#         [0, 4],       # PAY_AMT3
+#         [0, 4],       # PAY_AMT4
+#         [0, 4],       # PAY_AMT5
+#         [0, 4]        # PAY_AMT6
+#     ])
+    
+#     print("Using FairnessEvaluator class:")
+#     print("Original Model:")
+#     original_evaluator = FairnessEvaluator(original_model, constraint, protected_attribs=[1])  # SEX
+#     original_evaluator.evaluate_individual_fairness()
+    
+#     print("\nFairer Model:")
+#     fairer_evaluator = FairnessEvaluator(fairer_model, constraint, protected_attribs=[1])
+#     fairer_evaluator.evaluate_individual_fairness()
+
+#     y_pred_orig = (original_model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+#     y_pred_fair = (fairer_model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    
+#     accuracy_orig = accuracy_score(y_test, y_pred_orig)
+#     accuracy_fair = accuracy_score(y_test, y_pred_fair)
+    
+#     print(f"Original model accuracy: {accuracy_orig:.4f}")
+#     print(f"Fairer model accuracy: {accuracy_fair:.4f}")
+
+#     print("="*40)
