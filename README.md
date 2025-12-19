@@ -3,6 +3,48 @@
 This repository contains the source code, benchmark models, and datasets for the paper
 **"Verification-Guided Fairness Repair for Neural Networks"**, presented in [Conf Place].
 
+## Model Repair
+
+### VeriFair
+
+We recommend to use a conda environment to make things easier:
+
+```shell
+conda create -n verifair python=3.7
+conda activate verifair
+```
+
+Run the setup script to install requirements
+
+```shell
+bash setup.sh
+```
+
+Use run_repair.sh to automate the evaluation pipeline across datasets:
+
+```shell
+bash run_repair.sh [DATASET]
+```
+
+Supported Datasets:
+AC - Adult
+BM - Bank Marketing
+GC - German Credit
+DF - Default
+UCI - Student Performance
+
+Example Usage:
+
+```shell
+bash run_repair.sh AC
+bash run_repair.sh BM
+bash run_repair.sh GC
+bash run_repair.sh DF
+bash run_repair.sh UCI
+```
+
+## Counterexample Generation
+
 ### Fairify
 
 The current version has been tested on Python 3.7.
@@ -104,5 +146,3 @@ Finally, run the desired verification on any of the four datasets using their co
 The results of running these scripts are also saved under `FairQuant/res` folder as .txt files.
 Specifically, they report the time the verification problem took, number of counterexamples found, as well as final Certified, Falsified, and Undecided rates.
 These are the data reported as FairQuant results in Table 2 of the paper.
-
-### VeriFair
